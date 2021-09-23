@@ -86,6 +86,14 @@ class PostgresqlCharm(CharmBase):
         }
         # Add intial Pebble config layer using the Pebble API
         container.add_layer("postgresql", pebble_layer, combine=True)
+        # For some reason, entrypoint.sh is coming up with non-executable permissions.
+        # Running a read-then-write on the same file but changing the permissions
+        # to fix it.
+        container.push(
+            "/usr/local/bin/docker-entrypoint.sh",
+            container.pull("/usr/local/bin/docker-entrypoint.sh"),
+            make_dirs=True, permissions=0o755,
+        )
         container.autostart()
         self.unit.status = ActiveStatus()
         # self._configure_postgresql(event)
@@ -97,7 +105,7 @@ class PostgresqlCharm(CharmBase):
 
     def _configure_postgresql(self, event):
         container = self.unit.get_container(self.app.name)
-        if container.can_connect():
+        if not container.can_connect():
             if event:
                 event.defer()
             return
@@ -242,7 +250,7 @@ class PostgresqlCharm(CharmBase):
         settings = self.assemble_postgresql_conf()
         path = self.postgresql_conf_path()
 
-        with open(path, "r") as f:
+        with container.pull(path) as f:
             pg_conf = f.read()
 
         start_mark = "### BEGIN JUJU SETTINGS ###"
