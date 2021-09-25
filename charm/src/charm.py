@@ -22,10 +22,12 @@ from ops.charm import CharmBase
 from ops.framework import StoredState
 from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus
+from ops.pebble import PathError
 
 logger = logging.getLogger(__name__)
 
-POSTGRESQL_ETC_PATH = "/etc/postgresql/{}/main"
+# POSTGRESQL_CONF_PATH = "/etc/postgresql/{}/main"
+POSTGRESQL_CONF_PATH = "/var/lib/postgresql/data"
 TEMPLATE_DIR = "templates/"
 
 
@@ -53,6 +55,7 @@ class PostgresqlCharm(CharmBase):
         self.framework.observe(self.on["peer"].relation_departed, self.on_config_changed)
         # Defining stored default
         self.stored.set_default(pgconf="")
+        self.stored.set_default(pebble_ready_ran=False)
 
     @property
     def pg_version(self):
@@ -78,7 +81,7 @@ class PostgresqlCharm(CharmBase):
                 "postgresql": {
                     "override": "replace",
                     "summary": "postgresql unit",
-                    "command": "/usr/local/bin/docker-entrypoint.sh postgres",
+                    "command": "/usr/local/bin/docker-entrypoint.sh postgres -D /var/lib/postgresql/data",
                     "startup": "enabled",
                     "environment": {"POSTGRES_PASSWORD": "password"}
                 }
@@ -86,17 +89,18 @@ class PostgresqlCharm(CharmBase):
         }
         # Add intial Pebble config layer using the Pebble API
         container.add_layer("postgresql", pebble_layer, combine=True)
-        # For some reason, entrypoint.sh is coming up with non-executable permissions.
-        # Running a read-then-write on the same file but changing the permissions
-        # to fix it.
-        container.push(
-            "/usr/local/bin/docker-entrypoint.sh",
-            container.pull("/usr/local/bin/docker-entrypoint.sh"),
-            make_dirs=True, permissions=0o755,
-        )
+#        # For some reason, entrypoint.sh is coming up with non-executable permissions.
+#        # Running a read-then-write on the same file but changing the permissions
+#        # to fix it.
+#        container.push(
+#            "/usr/local/bin/docker-entrypoint.sh",
+#            container.pull("/usr/local/bin/docker-entrypoint.sh"),
+#            make_dirs=True, permissions=0o755,
+#        )
         container.autostart()
         self.unit.status = ActiveStatus()
-        # self._configure_postgresql(event)
+        self.stored.pebble_ready_ran = True
+        self._configure_postgresql(event)
 
     def on_config_changed(self, event):
         """Just an example to show how to deal with changed configuration.
@@ -104,17 +108,41 @@ class PostgresqlCharm(CharmBase):
         self._configure_postgresql(event)
 
     def _configure_postgresql(self, event):
+        if not self.stored.pebble_ready_ran:
+            # There is no point going through this logic without having the container
+            # in place. We need the config files to kickstart it.
+            event.defer()
+            return
+
         container = self.unit.get_container(self.app.name)
         if not container.can_connect():
             if event:
                 event.defer()
             return
+
+        pg_conf = None
+        try:
+            with container.pull(self.postgresql_conf_path()) as f:
+                pg_conf = f.read()
+        except PathError as e:
+            if e.kind == "not-found":
+                # Ignored, probably because postgresql has not been initialized yet
+                pass
+                # container.push(self.postgresql_conf_path(), "", make_dirs=True)
+
         container.push(
-            self.postgresql_conf_path,
-            self.update_postgresql_conf(),
+            self.postgresql_conf_path(),
+            self.update_postgresql_conf(container, pg_conf),
             make_dirs=True)
-        # container.start()
-        svc = container.get_service("postgresql")
+        svc = None
+        try:
+            svc = container.get_service("postgresql")
+        except:
+            # It is possible that pebble-ready hook did not run yet.
+            # defer the event and wait for it to be available.
+            if event:
+                event.defer()
+            return
         if svc.is_running():
             container.restart("postgresql")
         else:
@@ -131,11 +159,11 @@ class PostgresqlCharm(CharmBase):
             return yaml.safe_load(f)
 
     def postgresql_conf_path(self):
-        etc_path = POSTGRESQL_ETC_PATH.format(self.pg_version)
+        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
         return os.path.join(etc_path, "postgresql.conf")
 
     def hot_standby_conf_path(self):
-        etc_path = POSTGRESQL_ETC_PATH.format(self.pg_version)
+        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
         return os.path.join(etc_path, "juju_recovery.conf")
 
     def _parse_config(self, unparsed_config, fatal=True):
@@ -200,7 +228,7 @@ class PostgresqlCharm(CharmBase):
         # We load defaults from the extra_pg_conf default in config.yaml,
         # which ensures that they never get out of sync.
         raw = self.config_yaml()["options"]["extra_pg_conf"]["default"]
-        defaults = self.parse_config(raw)
+        defaults = self._parse_config(raw)
         """
         TODO: REVIEW!!
 
@@ -228,7 +256,7 @@ class PostgresqlCharm(CharmBase):
 
     def postgresql_conf_overrides(self):
         """User postgresql.conf overrides, from service configuration."""
-        return self.parse_config(self.config["extra_pg_conf"])
+        return self._parse_config(self.config["extra_pg_conf"])
 
     def assemble_postgresql_conf(self):
         """Assemble postgresql.conf settings and return them as a dictionary."""
@@ -239,7 +267,7 @@ class PostgresqlCharm(CharmBase):
         conf.update(self.postgresql_conf_overrides())
         return conf
 
-    def update_postgresql_conf(self):
+    def update_postgresql_conf(self, container, pg_conf):
         """Generate postgresql.conf
 
         Borrowed from:
@@ -248,31 +276,28 @@ class PostgresqlCharm(CharmBase):
             reactive/postgresql/service.py#L820
         """
         settings = self.assemble_postgresql_conf()
-        path = self.postgresql_conf_path()
-
-        with container.pull(path) as f:
-            pg_conf = f.read()
 
         start_mark = "### BEGIN JUJU SETTINGS ###"
         end_mark = "### END JUJU SETTINGS ###"
 
-        # Strip the existing settings section, including the markers.
-        pg_conf = re.sub(
-            r"^\s*{}.*^\s*{}\s*$".format(re.escape(start_mark), re.escape(end_mark)),
-            "",
-            pg_conf,
-            flags=re.I | re.M | re.DOTALL,
-        )
-
-        for k in settings:
-            # Comment out conflicting options. We could just allow later
-            # options to override earlier ones, but this is less surprising.
+        if len(pg_conf) > 0:
+            # Strip the existing settings section, including the markers.
             pg_conf = re.sub(
-                r"^\s*({}[\s=].*)$".format(re.escape(k)),
-                r"# juju # \1",
+                r"^\s*{}.*^\s*{}\s*$".format(re.escape(start_mark), re.escape(end_mark)),
+                "",
                 pg_conf,
-                flags=re.M | re.I,
+                flags=re.I | re.M | re.DOTALL,
             )
+
+            for k in settings:
+                # Comment out conflicting options. We could just allow later
+                # options to override earlier ones, but this is less surprising.
+                pg_conf = re.sub(
+                    r"^\s*({}[\s=].*)$".format(re.escape(k)),
+                    r"# juju # \1",
+                    pg_conf,
+                    flags=re.M | re.I,
+                )
 
         # Store the updated charm options. This is compared with the
         # live config to detect if a restart is required.

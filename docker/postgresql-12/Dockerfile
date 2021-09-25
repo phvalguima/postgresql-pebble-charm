@@ -161,6 +161,11 @@ RUN set -eux; \
 
 RUN mkdir -p /var/run/postgresql && chown -R postgres:postgres /var/run/postgresql && chmod 2777 /var/run/postgresql
 
+RUN mkdir -p "/etc/postgresql/$PG_MAJOR/main/" && \
+    chown -R postgres:postgres "/etc/postgresql/$PG_MAJOR" && \
+    chown -R postgres:postgres "/etc/postgresql/$PG_MAJOR/main" && \
+    chmod 755 "/etc/postgresql/$PG_MAJOR/main/"
+
 ENV PGDATA /var/lib/postgresql/data
 # this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
 RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PGDATA"

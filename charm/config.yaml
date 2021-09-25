@@ -1,14 +1,36 @@
 # Copyright 2021 pguimaraes
 # See LICENSE file for licensing details.
-#
-# TEMPLATE-TODO: change this example to suit your needs.
-# If you don't need a config, you can remove the file entirely.
-# It ties in to the example _on_config_changed handler in src/charm.py
-#
-# Learn more about config at: https://juju.is/docs/sdk/config
 
 options:
-  thing:
-    default: 🎁
-    description: A thing used by the charm.
+  extra_pg_conf:
     type: string
+    description:
+      The defaults here match the defaults chosen by the charm,
+      so removing them will not change them. They are listed
+      as documentation. The charm actually loads the non-calculated
+      defaults from this config.yaml file to make it unlikely it will
+      get out of sync with reality.
+    default: |
+      listen_addresses='*'
+      ssl=true
+      # log_timezone=UTC  Bug #1580331
+      log_checkpoints=true
+      log_connections=true
+      log_disconnections=true
+      log_autovacuum_min_duration=-1
+      log_line_prefix='%t [%p]: [%l-1] db=%d,user=%u '
+      archive_mode=on
+      archive_command='/bin/true'
+      hot_standby=true
+      max_wal_senders=10
+      # max_wal_senders=num_units * 2 + 5
+      # wal_level=hot_standby (<9.4) or logical (>=9.4)
+      # shared_buffers=total_ram*0.25
+      # effective_cache_size=total_ram*0.75
+      default_statistics_target=250
+      from_collapse_limit=16
+      join_collapse_limit=16
+      wal_buffers=-1
+      checkpoint_completion_target=0.9
+      # password_encryption=true
+      max_connections=100
