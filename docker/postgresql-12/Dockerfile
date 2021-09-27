@@ -4,6 +4,10 @@
 FROM ubuntu:20.04
 
 ENV PG_MAJOR 12
+ENV PG_VERSION 12
+
+
+
 ENV PATH $PATH:/usr/lib/postgresql/$PG_MAJOR/bin
 # apt-get build-dep is asking for inputs
 ENV DEBIAN_FRONTEND noninteractive
@@ -136,6 +140,8 @@ RUN set -ex; \
 	sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf; \
 	apt-get install -y --no-install-recommends \
 		"postgresql-$PG_MAJOR" \
+# Needed for extesions: installing dependencies
+                "postgresql-server-dev-$PG_MAJOR" \
 	; \
 	\
 	rm -rf /var/lib/apt/lists/*; \
@@ -169,7 +175,53 @@ RUN mkdir -p "/etc/postgresql/$PG_MAJOR/main/" && \
 ENV PGDATA /var/lib/postgresql/data
 # this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
 RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PGDATA"
-VOLUME /var/lib/postgresql/data
+VOLUME /var/lib/postgresql
+
+###################
+#                 #
+#                 #
+#  PG EXTENSIONS  #
+#                 #
+#                 #
+###################
+
+
+#### PG AUTO FAILOVER
+ENV PG_AUTO_FAILOVER v1.6.2
+RUN apt update
+RUN apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates curl gnupg git \
+    iproute2 \
+    libicu-dev \
+    libkrb5-dev \
+    libssl-dev \
+    libedit-dev \
+    libreadline-dev \
+    libpam-dev \
+    zlib1g-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    libselinux1-dev \
+    make \
+    openssl \
+    pipenv \
+    python3-nose \
+    python3 python3-setuptools python3-psycopg2 \
+    python3-pip \
+    lsof \
+    psutils valgrind
+RUN pip3 install pyroute2>=0.5.17
+RUN git clone -b ${PG_AUTO_FAILOVER} https://github.com/citusdata/pg_auto_failover
+RUN cd pg_auto_failover; make -s clean && make -s install -j8; cd ..; rm -rf pg_auto_failover
+
+####### PG AUTO FAILOVER: Create the monitor folder
+RUN mkdir -p "/var/lib/postgresql/monitor/" && \
+    chown -R postgres:postgres "/var/lib/postgresql/monitor"
+
+###################
+###################
+###################
 
 COPY docker-entrypoint.sh /usr/local/bin/
 ENTRYPOINT ["docker-entrypoint.sh"]

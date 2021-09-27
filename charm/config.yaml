@@ -2,17 +2,44 @@
 # See LICENSE file for licensing details.
 
 options:
+  ssl_cert:
+    default: ''
+    type: string
+    description: |
+      Certificate with CA certificate chain to be used in base64
+      -----BEGIN CERTIFICATE-----
+      <Primary cert in PEM format for your-domain>
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      <First intermediate CA certificate>
+      -----END CERTIFICATE-----
+      . . . . .
+      (there may be more than one intermediate cert)
+      . . . . .
+      -----BEGIN CERTIFICATE-----
+      <root-ca>
+      -----END CERTIFICATE-----
+      Pass the file with the certificate chain above as:
+      $ juju config <your-charm> ssl_cert="$(cat <crt file> | base64 -w0)"
+      Or in the bundle, using: include-base64://<path to crt file>
+  ssl_key:
+    default: ''
+    type: string
+    description: |
+      Key to be used in base64
   extra_pg_conf:
     type: string
-    description:
+    description: |
       The defaults here match the defaults chosen by the charm,
       so removing them will not change them. They are listed
       as documentation. The charm actually loads the non-calculated
       defaults from this config.yaml file to make it unlikely it will
       get out of sync with reality.
+      CERTIFICATES SUPPORT
+      Avoid manually enabling SSL supportvia extra_pg_conf. Use ssl_cert
+      and ssl_key options instead
     default: |
       listen_addresses='*'
-      ssl=true
       # log_timezone=UTC  Bug #1580331
       log_checkpoints=true
       log_connections=true

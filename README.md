@@ -8,7 +8,7 @@ Pebble allows to manage postgresql and, whenever a config change happens, the se
 
 ## Usage
 
-To deploy it, run: .........x
+To deploy it, run: .........
 
 ### Test it locally with microk8s
 

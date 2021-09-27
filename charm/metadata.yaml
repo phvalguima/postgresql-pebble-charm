@@ -18,14 +18,14 @@ peers:
 storage:
   pgdata:
     type: filesystem
-    location: /var/lib/postgresql/data
+    location: /var/lib/postgresql
 
 containers:
   postgresql:
     resource: postgresql-image
     mounts:
       - storage: pgdata
-        location: /var/lib/postgresql/data
+        location: /var/lib/postgresql
 
 resources:
   postgresql-image:
