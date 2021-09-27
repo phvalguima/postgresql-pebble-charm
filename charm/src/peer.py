@@ -12,9 +12,8 @@ unit:
 
 """
 
-from ops.framework import Object
-
 from .postgresql_relation import PostgresqlRelation
+
 
 def peer_username():
     # Leading underscore for 'system' accounts, to avoid an unlikely
@@ -69,11 +68,27 @@ class PostgresqlPeerRelation(PostgresqlRelation):
 
     def get_primary_ip(self):
         """Returns the primary ingress-address, or None if not available."""
+        latest_ts = self.relation.data[self.unit].get("primary", -1.0)
+        primary = self.unit if latest_ts > 0.0 else None
         for u in self.relation.units:
-            if "primary" in self.relation.data[u]:
-                return self.relation.data[u]["ingress-address"]
-        return None
+            if latest_ts < self.relation.data[u].get("primary", -2.0):
+                # More recent timestamp, update:
+                latest_ts = self.relation.data[u]["primary"]
+                primary = u
+        return self.relation.data[primary]["ingress-address"] if primary else None
 
+    def is_primary(self):
+        """Returns True if this unit holds the latest"""
+        latest_ts = self.relation.data[self.unit].get("primary", -1.0)
+        primary = self.unit if latest_ts > 0.0 else None
+        for u in self.relation.units:
+            if latest_ts < self.relation.data[u].get("primary", -2.0):
+                # More recent timestamp, update:
+                latest_ts = self.relation.data[u]["primary"]
+                primary = u
+        if primary and primary == self.unit:
+            return True
+        return False
 
     def disable_primary_management(self):
         """This method disables the primary management."""
@@ -98,6 +113,6 @@ class PostgresqlPeerRelation(PostgresqlRelation):
                         # Remove the key
                         del self.relation.data[self.unit]["primary"]
                     elif self.relation.data[u]["primary"] == primary and \
-                         self.unit.name.split("/")[1] < u.name.split("/")[1]:
+                            self.unit.name.split("/")[1] < u.name.split("/")[1]:
                         # Corner case, check the unit names and take the biggest
                         del self.relation.data[self.unit]["primary"]

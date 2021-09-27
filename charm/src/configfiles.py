@@ -10,8 +10,11 @@ https://github.com/stub42/postgresql-charm/
 
 import re
 import logging
+import yaml
+import OrderedDict
+import itertools
 
-from .postgresql import quote_identifier
+from .postgresql import quote_identifier, addr_to_range
 from .peer import peer_username
 
 logger = logging.getLogger(__name__)
@@ -32,9 +35,11 @@ DO_NOT_TOUCH_KEYS = [
     "synchronous_standby_names"
 ]
 
+
 def config_yaml():
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
+
 
 def _parse_config(unparsed_config, fatal=True):
     """Parse a postgresql.conf style string, returning a dictionary.
@@ -89,7 +94,8 @@ def _parse_config(unparsed_config, fatal=True):
             raise SystemExit(0)
     return parsed
 
-def postgresql_conf_defaults(self):
+
+def postgresql_conf_defaults(pg_version="12"):
     """Return the postgresql.conf defaults, which we parse from config.yaml"""
     # We load defaults from the extra_pg_conf default in config.yaml,
     # which ensures that they never get out of sync.
@@ -111,7 +117,7 @@ def postgresql_conf_defaults(self):
     defaults["effective_cache_size"] = "{} MB".format(effective_cache_size)
     """
     # PostgreSQL 10 introduces multiple password encryption methods.
-    if self.pg_version == "10":
+    if pg_version == "10":
         # Change this to scram-sha-256 next LTS release, when we can
         # start assuming clients have libpq 10. The setting can of
         # course still be overridden in the config.
@@ -119,6 +125,7 @@ def postgresql_conf_defaults(self):
     else:
         defaults["password_encryption"] = True
     return defaults
+
 
 def postgresql_conf_overrides(config):
     """User postgresql.conf overrides, from service configuration.
@@ -128,7 +135,8 @@ def postgresql_conf_overrides(config):
 
     return _parse_config(config["extra_pg_conf"])
 
-def assemble_postgresql_conf(config):
+
+def assemble_postgresql_conf(config, pg_version="12"):
     """Assemble postgresql.conf settings and return them as a dictionary.
 
     config: reference pointer to self.config options of the charm.
@@ -136,19 +144,19 @@ def assemble_postgresql_conf(config):
 
     conf = {}
     # Start with charm defaults.
-    conf.update(postgresql_conf_defaults())
+    conf.update(postgresql_conf_defaults(pg_version))
     # User overrides from service config.
     conf.update(postgresql_conf_overrides(config))
     return conf
 
+
 def update_postgresql_conf(
-    container, config, pg_conf,
-    pg_version="12", enable_ssl=False):
+        container, config, pg_conf, hot_standby_conf_path, pg_version="12", enable_ssl=False):
     """Generate postgresql.conf
 
     config: reference pointer to self.config options of the charm.
     """
-    settings = assemble_postgresql_conf(config)
+    settings = assemble_postgresql_conf(config, pg_version)
 
     start_mark = "### BEGIN JUJU SETTINGS ###"
     end_mark = "### END JUJU SETTINGS ###"
@@ -190,7 +198,7 @@ def update_postgresql_conf(
             v = "'{}'".format(v.replace("'", "''"))
         override_section.append("{} = {}".format(k, v))
     if pg_version == "12":
-        override_section.append("include_if_exists '{}'".format(self.hot_standby_conf_path()))
+        override_section.append("include_if_exists '{}'".format(hot_standby_conf_path))
 
     # Last thing: check if ssl is enabled:
     override_section.append("ssl = true" if enable_ssl else "ssl = false")
@@ -199,6 +207,46 @@ def update_postgresql_conf(
     pg_conf += "\n" + "\n".join(override_section)
 
     return pg_conf
+
+
+def incoming_addresses(relinfo):
+    """Return the incoming address range(s) if present in relinfo.
+    Address ranges are in CIDR format. eg. 192.168.1.0/24 or 2001::F00F/128.
+    We look for information as provided by recent versions of Juju, and
+    fall back to private-address if needed.
+    Returns an empty list if no address information is present. An
+    error is logged if this occurs, as something has gone seriously
+    wrong.
+    """
+    # This helper could return a set, but a list with stable ordering is
+    # easier to use without causing flapping.
+    if "egress-subnets" in relinfo:
+        return [n.strip() for n in relinfo["egress-subnets"].split(",") if n.strip()]
+    if "ingress-address" in relinfo:
+        return [addr_to_range(relinfo["ingress-address"])]
+    if "private-address" in relinfo:
+        return [addr_to_range(relinfo["private-address"])]
+    return []
+
+
+def split_extra_pg_auth(raw_extra_pg_auth):
+    """Yield the extra_pg_auth stanza line by line.
+    Uses the input as a multi-line string if valid, or falls
+    back to comma separated for backwards compatibility.
+    """
+    # Lines in a pg_hba.conf file must be comments, whitespace, or begin
+    # with 'local' or 'host'.
+    valid_re = re.compile(r"^\s*(host.*|local.*|#.*)?\s*$")
+
+    def valid_line(ln):
+        return valid_re.search(ln) is not None
+
+    lines = list(raw_extra_pg_auth.split(","))
+    if len(lines) > 1 and all(valid_line(ln) for ln in lines):
+        return lines
+    else:
+        return raw_extra_pg_auth.splitlines()
+
 
 def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, enable_ssl):
     """Update the pg_hba.conf file (host based authentication)."""
@@ -221,17 +269,21 @@ def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, enable_ssl):
     # connect as the postgres user to all databases.
     add("local", "all", "postgres", "peer", "map=juju_charm")
 
+    """
+    TODO: DO WE NEED NAGIOS??
+
     # The local unit needs access to its own database. Let every local
     # user connect to their matching PostgreSQL user, if it exists, and
     # nagios with a password.
     add("local", "all", nagios.nagios_username(), "password")
     add("local", "all", "all", "peer")
+    """
 
     # Peers need replication access as the charm replication user.
     if _peer_rel:
         for peer, relinfo in _peer_rel.items():
             for addr in incoming_addresses(relinfo):
-                qaddr = postgresql.quote_identifier(addr)
+                qaddr = quote_identifier(addr)
                 # Magic replication database, for replication.
                 add(
                     host(enable_ssl),
@@ -250,9 +302,9 @@ def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, enable_ssl):
                     "md5",
                     "# {}".format(relinfo),
                 )
-"""
+    """
 
-TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
+    TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
 
     # Clients need access to the relation database as the relation users.
     for rel in rels["db"].values():
@@ -263,17 +315,17 @@ TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
                     # magic tokens like 'all'.
                     add(
                         host(enable_ssl),
-                        postgresql.quote_identifier(rel.local["database"]),
-                        postgresql.quote_identifier(rel.local["user"]),
-                        postgresql.quote_identifier(addr),
+                        quote_identifier(rel.local["database"]),
+                        quote_identifier(rel.local["user"]),
+                        quote_identifier(addr),
                         "md5",
                         "# {}".format(relinfo),
                     )
                     add(
                         host(enable_ssl),
-                        postgresql.quote_identifier(rel.local["database"]),
-                        postgresql.quote_identifier(rel.local["schema_user"]),
-                        postgresql.quote_identifier(addr),
+                        quote_identifier(rel.local["database"]),
+                        quote_identifier(rel.local["schema_user"]),
+                        quote_identifier(addr),
                         "md5",
                         "# {}".format(relinfo),
                     )
@@ -290,7 +342,7 @@ TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
                         host(enable_ssl),
                         "all",
                         "all",
-                        postgresql.quote_identifier(addr),
+                        quote_identifier(addr),
                         "md5",
                         "# {}".format(relinfo),
                     )
@@ -305,21 +357,22 @@ TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
                 add(
                     host(enable_ssl),
                     "replication",
-                    postgresql.quote_identifier(rel.local["user"]),
-                    postgresql.quote_identifier(addr),
+                    quote_identifier(rel.local["user"]),
+                    quote_identifier(addr),
                     "md5",
                     "# {}".format(relinfo),
                 )
                 if "database" in rel.local:
                     add(
                         host(enable_ssl),
-                        postgresql.quote_identifier(rel.local["database"]),
-                        postgresql.quote_identifier(rel.local["user"]),
-                        postgresql.quote_identifier(addr),
+                        quote_identifier(rel.local["database"]),
+                        quote_identifier(rel.local["user"]),
+                        quote_identifier(addr),
                         "md5",
                         "# {}".format(relinfo),
                     )
-"""
+    """ # noqa
+
     # External administrative addresses, if specified by the operator.
     for addr in config["admin_addresses"].split(","):
         if addr:
@@ -327,13 +380,13 @@ TODO: ADD THE METHODS BELOW AS NEW RELATIONS ARE ADDED
                 host(enable_ssl),
                 "all",
                 "all",
-                postgresql.quote_identifier(postgresql.addr_to_range(addr)),
+                quote_identifier(addr_to_range(addr)),
                 "md5",
                 "# admin_addresses config",
             )
 
     # And anything-goes rules, if specified by the operator.
-    for line in helpers.split_extra_pg_auth(config["extra_pg_auth"]):
+    for line in split_extra_pg_auth(config["extra_pg_auth"]):
         add(line + " # extra_pg_auth config")
 
     # Deny everything else

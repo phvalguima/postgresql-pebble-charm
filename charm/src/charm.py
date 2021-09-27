@@ -26,7 +26,7 @@ from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus
 from ops.pebble import PathError
 
-from .peer import PostgresqlPeerRelation
+from .peer import PostgresqlPeerRelation, peer_username
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +35,17 @@ TEMPLATE_DIR = "templates/"
 PGDATA_PATH = "/var/lib/postgresql/data"
 
 
-def _render(configs, pgversion="12"):
+def _render(configs, filepath, template_dir="templates/"):
     from jinja2 import Environment, FileSystemLoader
-    env = Environment(loader=FileSystemLoader("templates/"))
-    template = env.get_template(os.path.join(TEMPLATE_DIR, "postgresql.conf.j2"))
+    env = Environment(loader=FileSystemLoader(template_dir))
+    template = env.get_template(os.path.join(template_dir, filepath))
     config = template.render(**configs)
     return config
+
+
+class PostgresqlClonePrimaryError(Exception):
+    def __init__(self, msg):
+        super().__init__(msg)
 
 
 class PostgresqlCharm(CharmBase):
@@ -62,6 +67,8 @@ class PostgresqlCharm(CharmBase):
         self.stored.set_default(pg_hba="")
         self.stored.set_default(enable_ssl=False)
         self.stored.set_default(pebble_ready_ran=False)
+        self.stored.set_default(primary_ip="")
+        self.stored.set_default(db_password="password")
         # Relation setup
         self.peer_rel = PostgresqlPeerRelation(self, "peer")
 
@@ -105,17 +112,19 @@ class PostgresqlCharm(CharmBase):
                 "postgresql": {
                     "override": "replace",
                     "summary": "postgresql unit",
-                    "command": "/usr/local/bin/docker-entrypoint.sh postgres -D /var/lib/postgresql/data",
+                    "command": "/usr/local/bin/docker-entrypoint.sh postgres -D /var/lib/postgresql/data", # noqa
                     "startup": "enabled",
-                    "environment": {"POSTGRES_PASSWORD": "password"}
-#                },
-#                "pg_autoctl": {
-#                    "override": "replace",
-#                    "summary": "pg auto failover mechanism"
-#                    "command": "/usr/lib/postgresql/12/bin/pg_autoctl --pgdata /var/lib/postgresql/monitor --pgport 5000",
-#                    "user": "postgres",
-#                    "group": "postgres",
-#                    "environment": {}
+                    "environment": {"POSTGRES_PASSWORD": self.stored.db_password}
+                """
+                # },
+                # "pg_autoctl": {
+                #     "override": "replace",
+                #     "summary": "pg auto failover mechanism"
+                #    "command": "/usr/lib/postgresql/12/bin/pg_autoctl --pgdata /var/lib/postgresql/monitor --pgport 5000",
+                #     "user": "postgres",
+                #     "group": "postgres",
+                #     "environment": {}
+                """ # noqa
                 }
             },
         }
@@ -163,7 +172,7 @@ class PostgresqlCharm(CharmBase):
         svc = None
         try:
             svc = container.get_service("postgresql")
-        except:
+        except: # noqa
             # It is possible that pebble-ready hook did not run yet.
             # defer the event and wait for it to be available.
             if event:
@@ -192,15 +201,16 @@ class PostgresqlCharm(CharmBase):
         self.stored.pgconf = update_postgresql_conf(
             container, self.config,
             self._read_container_file(self.postgresql_conf_path()),
+            self.hot_standby_conf_path(),
             self.pg_version, self.stored.enable_ssl)
         container.push(
             self.postgresql_conf_path(),
-            self.stored.pgconf, 
+            self.stored.pgconf,
             user="postgres", group="postgres",
             permissions=0o640, make_dirs=True)
 
     def ssl_config(self, container):
-        if len(self.config.get("ssl_cert", "")) > 0 or
+        if len(self.config.get("ssl_cert", "")) > 0 or \
            len(self.config.get("ssl_key", "")) > 0:
             logger.info("ssl_config: crt or key not passed, returning")
             self.stored.enable_ssl = False
@@ -218,10 +228,9 @@ class PostgresqlCharm(CharmBase):
             # Picks the list above and get up to the before last element
             # the last element is the server.crt, attach the begin prefix
             # and return both
-            return begin.join(list_certs[0:-1]),
-                begin + list_certs[-1:][0]
+            return begin.join(list_certs[0:-1]), begin + list_certs[-1:][0]
 
-        # Root cert is composed of all the 
+        # Root cert is composed of all the certs except last one
         root_crt, server_crt = __process_cert(base64.b64.decode(
             self.config["ssl_cert"].encode("utf-8")))
         # Generate ssl_cert
@@ -245,16 +254,30 @@ class PostgresqlCharm(CharmBase):
             permissions=0o600, make_dirs=True)
         self.stored.enable_ssl = True
 
-    def clone_master(self, container):
+    def clone_primary(self, container):
+        """Clone the primary database and kickstart the replication process.
+
+        There are some validation checks we must run in order to be sure the database
+        will not be accidently compromised. If any of these checks fail, raise
+        PostgresqlClonePrimaryError.
+
+        It is expected the postgresql service to be disabled before running this method.
+        """
         primary_ip = self.peer_rel.get_primary_ip()
-        master_relinfo = peer_rel[master]
+
         # Validation checks
-        if not peer_rel.is_primary():
+        if not primary_ip:
+            logger.warning("Validation Check Failed: primary_ip not found")
+            raise PostgresqlClonePrimaryError("Primary IP not found")
+        if peer_rel.is_primary():
             logger.warning("Validation Check Failed: this unit is supposed to be primary")
-            return
+            raise PostgresqlClonePrimaryError("No Primary unit found")
         if container.get_service("postgresql").is_running():
             logger.warning("Validation Check Failed: service was supposed to be stopped")
-            return
+            raise PostgresqlClonePrimaryError("Postgresql service still running")
+
+        self.model.unit.status = \
+            MaintenanceStatus("Cloning {}".format(primary))
 
         # Clean up data directory so pg_basebackup can take place
         container.remove_path(PGDATA_PATH, recursive=True)
@@ -262,6 +285,7 @@ class PostgresqlCharm(CharmBase):
         container.make_dir(
             PGDATA_PATH, make_parents=True, permissions=)
 
+        # After v10, use --wal-method instead
         if self.pg_version >= "10":
             wal_method = "--wal-method=stream"
         else:
@@ -282,34 +306,62 @@ class PostgresqlCharm(CharmBase):
             "--progress",
             wal_method,
             "--no-password",
-            "--username=_juju_repl",
+            "--username={}".format(peer_username()),
         ]
         logger.info("Cloning {} with {}".format(master, " ".join(cmd)))
-        status_set("maintenance", "Cloning {}".format(master))
-        try:
-            # Switch to a directory the postgres user can access.
-            with helpers.switch_cwd("/tmp"):
-                subprocess.check_call(cmd, universal_newlines=True)
-        except subprocess.CalledProcessError as x:
-            hookenv.log("Clone failed with {}".format(x), ERROR)
-            # We failed, and the local cluster is broken.
-            status_set("blocked", "Failed to clone {}".format(master))
-            postgresql.drop_cluster()
-            reactive.remove_state("postgresql.cluster.configured")
-            reactive.remove_state("postgresql.cluster.created")
-            # Terminate. We need this hook to exit, rather than enter a loop.
-            raise SystemExit(0)
 
-        update_recovery_conf(follow=master)
+        self.update_recovery_conf(primary_ip, container)
 
         reactive.set_state("postgresql.replication.cloned")
-        update_replication_states()    
+
+        # Now, save the unit's IP that we are following
+        self.stored.primary_ip = primary_ip
+
+    def update_recovery_conf(primary_ip, container):
+        if primary_ip == self.peer_rel.relation.data[self.unit]["ingress-address"]:
+            # This is the primary, abort
+            logger.info("update_recovery_conf: should not be run as the primary")
+            container.remove_path(self.hot_standby_path())
+            container.remove_path(self.standby_signal_path())
+            return
+
+        container.push(
+            self.hot_standby_path(),
+            render({
+                "streaming_replication": True,
+                "host": primary_ip,
+                "port": 5432,
+                "user": peer_username(),
+                "password": self.stored.db_password
+            }, self.hot_standby_template())
+            user="postgres", group="postgres",
+            permissions=0o640, make_dirs=True)
+
+        if self.pg_version >= "12":
+            # Also create the standby.signal file
+            container.push(
+                self.standby_signal_path(), "",
+                user="postgres", group="postgres",
+                permissions=0o640, make_dirs=True)
+
+    def hot_standby_template(self):
+        if self.pg_version >= "12":
+            return "hot_standby.conf.j2"
+        return "recovery.conf.j2"
 
     ##################
     #                #
     # Get conf paths #
     #                #
     ##################
+
+    def standby_signal_path(self):
+        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
+        return os.path.join(etc_path, "standby.signal")
+
+    def hot_standby_path(self):
+        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
+        return os.path.join(etc_path, "juju_recovery.conf")
 
     def pg_hba_conf_path(self):
         etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)

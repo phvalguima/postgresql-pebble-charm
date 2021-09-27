@@ -21,6 +21,7 @@ RUN set -ex; \
 		apt-get install -y --no-install-recommends \
 			gnupg \
 			dirmngr \
+                        sudo \
 		; \
 		rm -rf /var/lib/apt/lists/*; \
 	fi
