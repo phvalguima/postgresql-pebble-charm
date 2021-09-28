@@ -37,7 +37,8 @@ class PsqlK8sAPI(object):
         will throw an Exception.
         """
         self._container = container
-        self._hostname = container.pull("/etc/hostname")
+        with container.pull("/etc/hostname") as f:
+            self._hostname = f.read().split("\n")[0]
         self._namespace = ops_model.name
 
         self._kubeconfig = yaml.safe_load(kubeconfig)
@@ -80,15 +81,7 @@ class PsqlK8sAPI(object):
             self.hostname,
             self.namespace,
             command=cmd,
+            container="postgresql",
             stderr=True, stdin=False,
             stdout=True, tty=False)
-
-        while resp.is_open():
-            resp.update(timeout=1)
-            if resp.peek_stdout():
-                logger.info("exec_command returned: %s" % resp.read_stdout())
-            if resp.peek_stderr():
-                resp.close()
-                raise PsqlK8sAPIPsqlK8sAPIError(
-                    "exec_command stderr returned: %s" % resp.read_stderr())
-        resp.close()
+        logger.debug("kube_api.py: exec_command returned {}".format(resp))

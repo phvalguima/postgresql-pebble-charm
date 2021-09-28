@@ -96,6 +96,40 @@ class PostgresqlCharm(CharmBase):
             ["apt", "install", "-y", "python3-psycopg2"],
             stdout=subprocess.DEVNULL)
 
+    def _stop_app(self):
+        """Stop procedure employed by Pebble is too tough for postgresql. This
+        method implements a stop routine that is more aligned with postgresql.
+        """
+        container = self.unit.get_container(self.app.name)
+        # Basic check: is postgresql still running? If yes, then we can run
+        # the pg_ctl to disable it. If the check within the try/catch below
+        # fails for any reason, we can consider that postmaster.pid is not
+        # available and return.
+        try:
+            content = ""
+            with container.pull(self.postmaster_pid_path()) as f:
+                content = f.read()
+            if len(content) == 0:
+                return
+        except: # noqa
+            return
+        cmd = [
+            "sudo",
+            "-u",
+            "postgres",
+            "/usr/lib/postgresql/12/bin/pg_ctl",
+            "stop",
+            "-D",
+            PGDATA_PATH
+        ]
+        logger.info("Stopping with {}".format(" ".join(cmd)))
+        # Run the command on the other container
+        kubeconfig = base64.b64decode(
+            self.config["kubeconfig"].encode("utf-8"))
+        PsqlK8sAPI(
+            container, kubeconfig, self.model
+        ).exec_command(cmd)
+
     def on_peer_relation_joined(self, event):
         """We need to select the primary unit and set the replication password.
         """
@@ -148,7 +182,7 @@ class PostgresqlCharm(CharmBase):
                 "postgresql": {
                     "override": "replace",
                     "summary": "postgresql unit",
-                    "command": "/usr/local/bin/docker-entrypoint.sh postgres -D /var/lib/postgresql/data", # noqa
+                    "command": "/usr/local/bin/docker-entrypoint.sh postgres", # noqa
                     "startup": "enabled",
                     "environment": {"POSTGRES_PASSWORD": self.stored.db_password}
                 }
@@ -167,6 +201,7 @@ class PostgresqlCharm(CharmBase):
         2) Generate the configuration files
         3) Restart strategy
         """
+        self.model.unit.status = MaintenanceStatus("Starting on_config_changed...")
 
         # 1) Validation Checks
         if not self.stored.pebble_ready_ran:
@@ -195,13 +230,15 @@ class PostgresqlCharm(CharmBase):
             if event:
                 event.defer()
             return
-
+        self.model.unit.status = MaintenanceStatus("Generate configs")
         # 2) Generate the configuration files
         # Following tasks need to be done:
         # 2.1) Check if primary, if not then stop the service
         if self.peer_rel.relation:
             if not self.peer_rel.is_primary() and svc.is_running():
                 # Stop service so we can run the replication
+                self._stop_app()
+                # Run the stop anyway to satisfy pebble internal state
                 container.stop("postgresql")
             # 2.2) Save the password on .pgpass
             update_pgpass(
@@ -219,14 +256,19 @@ class PostgresqlCharm(CharmBase):
         self._configure_pg_auth_conf(container)
         self._update_pg_ident_conf(container)
 
+        self.model.unit.status = MaintenanceStatus("(re)starting...")
+
         # 3) Restart strategy:
         # Use ops framework methods to restart services
         if svc.is_running():
             logger.debug("Restart call start time: {}".format(datetime.datetime.now()))
+            # container.restart("postgresql")
+            self._stop_app()
             container.restart("postgresql")
             logger.debug("Restart call end time: {}".format(datetime.datetime.now()))
         else:
             container.start("postgresql")
+        self.model.unit.status = ActiveStatus("psql configured")
 
     def _update_pg_ident_conf(self, container):
         """Add the charm's required entry to pg_ident.conf"""
@@ -244,9 +286,13 @@ class PostgresqlCharm(CharmBase):
                 )
                 is None
             ):
-                content = "\njuju_charm {} {}".format(sysuser, pguser)
+                content = current_pg_ident + \
+                    "\njuju_charm {} {}".format(sysuser, pguser)
+                logger.debug(
+                    "{}: Push to path {} content {}".format(
+                        datetime.datetime.now(), path, content))
                 container.push(
-                    self.pg_hba_conf_path(),
+                    path,
                     content,
                     user="postgres", group="postgres",
                     permissions=0o640, make_dirs=True)
@@ -259,6 +305,10 @@ class PostgresqlCharm(CharmBase):
             self.config, None, self.peer_rel.relation, peer_username(),
             self.stored.enable_ssl
         )
+        logger.debug(
+            "{}: Push to path {} content {}".format(
+                datetime.datetime.now(),
+                self.pg_hba_conf_path(), self.stored.pg_hba))
         container.push(
             self.pg_hba_conf_path(),
             self.stored.pg_hba,
@@ -271,6 +321,11 @@ class PostgresqlCharm(CharmBase):
             self._read_container_file(self.postgresql_conf_path()),
             self.hot_standby_conf_path(),
             self.pg_version, self.stored.enable_ssl)
+
+        logger.debug(
+            "{}: Push to path {} content {}".format(
+                datetime.datetime.now(),
+                self.postgresql_conf_path(), self.stored.pgconf))
         container.push(
             self.postgresql_conf_path(),
             self.stored.pgconf,
@@ -397,15 +452,19 @@ class PostgresqlCharm(CharmBase):
             container.remove_path(self.standby_signal_path())
             return
 
+        rendered = _render({
+            "streaming_replication": True,
+            "host": primary_ip,
+            "port": 5432,
+            "user": peer_username(),
+            "password": self.stored.db_password
+        }, self.hot_standby_template())
+        logger.debug(
+            "{}: Push to path {} content {}".format(
+                datetime.datetime.now(),
+                self.hot_standby_path(), rendered))
         container.push(
-            self.hot_standby_path(),
-            _render({
-                "streaming_replication": True,
-                "host": primary_ip,
-                "port": 5432,
-                "user": peer_username(),
-                "password": self.stored.db_password
-            }, self.hot_standby_template()),
+            self.hot_standby_path(), rendered,
             user="postgres", group="postgres",
             permissions=0o640, make_dirs=True)
 
@@ -429,6 +488,10 @@ class PostgresqlCharm(CharmBase):
     def pg_ident_conf_path(self):
         etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
         return os.path.join(etc_path, "pg_ident.conf")
+
+    def postmaster_pid_path(self):
+        etc_path = PGDATA_PATH.format(self.pg_version)
+        return os.path.join(etc_path, "postmaster.pid")
 
     def standby_signal_path(self):
         etc_path = PGDATA_PATH.format(self.pg_version)

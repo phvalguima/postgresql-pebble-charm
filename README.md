@@ -76,15 +76,6 @@ This charm needs to convert the way configuration is passed in k8s to a traditio
 
 The implementation of this application tries to be as close as possible to the [upstream postgresql image](https://github.com/docker-library/postgres). It differs by using Ubuntu as base image and Ubuntu's own postgresql package.
 
-## What this application needs?
-
-* Clustering: how to deploy postgresql in active/backup and ensure the data is correctly replicated
-* Scalability: how to distribute load across the units
-* Failover: how to move the postgresql leadership to another unit if needed
-* Alerting: how to make sure this service is working?
-* Telemetry: get performance-related data to Prometheus
-* Backup/Restore: generate full database and PITR 
-
 ## How this charm differs from postgresql-k8s
 
 Postgresql with pod-spec tracks leader and standby units via service in k8s. Pebble allows to keep the pod (hence its pod IP) even if we restart pod's internal services. The first difference here is the use of the Pod IP directly instead of k8s services.
@@ -102,3 +93,16 @@ The root password can be defined via config options ``` override-root-password: 
 ## Build the OCI image
 
 ## Build the charm
+
+# TODOs: What this application needs?
+
+Tasks:
+* Deprecate kube_api.py once [pebble#37](https://github.com/canonical/pebble/issues/37) is available
+
+Features:
+* Clustering: how to deploy postgresql in active/backup and ensure the data is correctly replicated
+* Scalability: how to distribute load across the units
+* Failover: how to move the postgresql leadership to another unit if needed
+* Alerting: how to make sure this service is working?
+* Telemetry: get performance-related data to Prometheus
+* Backup/Restore: generate full database and PITR 

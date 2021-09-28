@@ -2,6 +2,12 @@
 # See LICENSE file for licensing details.
 
 options:
+  kubeconfig:
+    type: string
+    default: ''
+    description: |
+      Used to issue commands against postgresql container. Pass it via base64:
+      $ juju config postgresql kubeconfig="$(cat ~/.kube/config | base64 -w0)"
   admin_addresses:
     type: string
     default: ''
