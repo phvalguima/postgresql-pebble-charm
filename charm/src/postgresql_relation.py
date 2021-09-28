@@ -6,18 +6,7 @@ Implements some common tasks for every type of postgresql relation.
 
 """
 
-import os
-import string
-
 from ops.framework import Object
-
-
-CHARS_PASSWORD = string.ascii_letters + string.digits
-
-
-def genRandomPassword(length=48):
-    return "".join(CHARS_PASSWORD[c % len(CHARS_PASSWORD)]
-                   for c in os.urandom(length))
 
 
 class PostgresqlRelation(Object):

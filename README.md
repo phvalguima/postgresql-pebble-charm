@@ -6,6 +6,8 @@ Running Postgresql with Pebble on top of k8s.
 
 Pebble allows to manage postgresql and, whenever a config change happens, the service can be restarted without losing the entire pod. In this case, the IP of the pod acting as the postgresql leader will announce its own pod IP instead of a service pointing only to it.
 
+In the documentation and the code, "primary database" or only "primary" refers to the unit running the database in Read/Write mode and holding the latest version of the data.
+
 ## Usage
 
 To deploy it, run: .........

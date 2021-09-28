@@ -8,10 +8,12 @@ https://github.com/stub42/postgresql-charm/
 
 """
 
+import os
 import re
 import logging
 import yaml
 import OrderedDict
+import string
 import itertools
 
 from .postgresql import quote_identifier, addr_to_range
@@ -19,11 +21,20 @@ from .peer import peer_username
 
 logger = logging.getLogger(__name__)
 
+
+CHARS_PASSWORD = string.ascii_letters + string.digits
+
+
+def genRandomPassword(length=48):
+    return "".join(CHARS_PASSWORD[c % len(CHARS_PASSWORD)]
+                   for c in os.urandom(length))
+
 ###################
 #                 #
 # CONF generation #
 #                 #
 ###################
+
 
 # This is a list of option keys that cannot be injected to postgresql.conf
 # via extra_pg_conf.
@@ -34,6 +45,20 @@ DO_NOT_TOUCH_KEYS = [
     "synchronous_commit",
     "synchronous_standby_names"
 ]
+
+
+def update_pgpass(container, replication_password):
+    accounts = ["root", "postgres", "ubuntu"]
+    for account in accounts:
+        path = os.path.expanduser(
+            os.path.join("~{}".format(account), ".pgpass"))
+        content = \
+            "# Managed by Juju\n*:*:*:{}:{}".format(
+                peer_username(), replication_password)
+        container.push(
+            path, content, user=account, group=account,
+            permissions=0o600, make_dirs=True
+        )
 
 
 def config_yaml():

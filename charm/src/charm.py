@@ -11,22 +11,24 @@ pebble.
 """
 
 import os
-import re
-import yaml
 import logging
 import base64
 import datetime
 
-import itertools
-from collections import OrderedDict
-
 from ops.charm import CharmBase
 from ops.framework import StoredState
 from ops.main import main
-from ops.model import ActiveStatus, BlockedStatus
+from ops.model import ActiveStatus, MaintenanceStatus
 from ops.pebble import PathError
 
 from .peer import PostgresqlPeerRelation, peer_username
+from .configfiles import (
+    update_pgpass,
+    generate_pg_hba_conf,
+    update_postgresql_conf
+)
+from .kube_api import PsqlK8sAPI
+from .postgresql import create_replication_user
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +62,8 @@ class PostgresqlCharm(CharmBase):
         self.framework.observe(self.on.config_changed, self.on_config_changed)
         self.framework.observe(self.on.leader_elected, self.on_config_changed)
         self.framework.observe(self.on.upgrade_charm, self.on_config_changed)
-        self.framework.observe(self.on["peer"].relation_joined, self.on_config_changed)
-        self.framework.observe(self.on["peer"].relation_departed, self.on_config_changed)
+        self.framework.observe(self.on["peer"].relation_joined, self.on_peer_relation_joined)
+        self.framework.observe(self.on["peer"].relation_departed, self.on_peer_relation_changed)
         # Defining stored default
         self.stored.set_default(pgconf="")
         self.stored.set_default(pg_hba="")
@@ -69,6 +71,8 @@ class PostgresqlCharm(CharmBase):
         self.stored.set_default(pebble_ready_ran=False)
         self.stored.set_default(primary_ip="")
         self.stored.set_default(db_password="password")
+        # Use it as a flag defining that replication user has been created
+        self.stored.set_default(repl_user="")
         # Relation setup
         self.peer_rel = PostgresqlPeerRelation(self, "peer")
 
@@ -85,7 +89,32 @@ class PostgresqlCharm(CharmBase):
     def on_start(self, event):
         pass
 
+    def on_peer_relation_joined(self, event):
+        """We need to select the primary unit and set the replication password.
+        """
+        if not self.unit.is_leader():
+            return
+        # Leader unit, set it as primary
+        self.set_as_primary()
+        self.set_replication_pwd()
+        self.peer_rel.peer_changed(event)
+
+    def on_peer_relation_changed(self, event):
+        """The actual setup of the secondary database happens now.
+        This gives the primary some time to set it up before.
+        """
+        # Create the replication user if primary:
+        if self.peer_rel.is_primary() and \
+           len(self.stored.repl_user) == 0:
+            self.stored.repl_user = peer_username()
+            create_replication_user(
+                self.stored.repl_user,
+                self.peer_rel.primary_repl_pwd()
+            )
+        self.on_config_changed(event)
+
     def _read_container_file(self, path):
+        container = self.unit.get_container(self.app.name)
         content = None
         try:
             with container.pull(path) as f:
@@ -115,16 +144,6 @@ class PostgresqlCharm(CharmBase):
                     "command": "/usr/local/bin/docker-entrypoint.sh postgres -D /var/lib/postgresql/data", # noqa
                     "startup": "enabled",
                     "environment": {"POSTGRES_PASSWORD": self.stored.db_password}
-                """
-                # },
-                # "pg_autoctl": {
-                #     "override": "replace",
-                #     "summary": "pg auto failover mechanism"
-                #    "command": "/usr/lib/postgresql/12/bin/pg_autoctl --pgdata /var/lib/postgresql/monitor --pgport 5000",
-                #     "user": "postgres",
-                #     "group": "postgres",
-                #     "environment": {}
-                """ # noqa
                 }
             },
         }
@@ -133,7 +152,6 @@ class PostgresqlCharm(CharmBase):
         container.autostart()
         self.unit.status = ActiveStatus()
         self.stored.pebble_ready_ran = True
-        self._configure_postgresql(event)
 
     def on_config_changed(self, event):
         """Just an example to show how to deal with changed configuration.
@@ -156,14 +174,6 @@ class PostgresqlCharm(CharmBase):
                 event.defer()
             return
 
-        # 2) Generate the configuration files
-        self.ssl_config(container)
-        self._configure_postgresql_conf(container, self.stored.enable_ssl)
-        self._configure_pg_auth_conf(container, self.stored.enable_ssl)
-
-        # 3) Restart strategy:
-        # Use ops framework methods to restart services
-
         # Seems that pebble-ready hook runs at some point after the
         # initial install and config-changed hooks. It means this method
         # and the search for service running will be run before the actual
@@ -178,6 +188,26 @@ class PostgresqlCharm(CharmBase):
             if event:
                 event.defer()
             return
+
+        # 2) Generate the configuration files
+        # Following tasks need to be done:
+        # 2.1) Check if primary, if not then stop the service
+        if self.peer_rel.relation:
+            if not self.peer_rel.is_primary():
+                # Stop service so we can run the replication
+                container.stop("postgresql")
+            # 2.2) Save the password on .pgpass
+            update_pgpass(container, self.peer_rel.primary_repl_pwd())
+            if not self.peer_rel.is_primary():
+                # Clone the repo from upstream
+                self.clone_primary()
+        # 2.3) Generate the configuration
+        self.ssl_config(container)
+        self._configure_postgresql_conf(container, self.stored.enable_ssl)
+        self._configure_pg_auth_conf(container, self.stored.enable_ssl)
+
+        # 3) Restart strategy:
+        # Use ops framework methods to restart services
         if svc.is_running():
             logger.debug("Restart call start time: {}".format(datetime.datetime.now()))
             container.restart("postgresql")
@@ -219,7 +249,6 @@ class PostgresqlCharm(CharmBase):
         # Breaks the certificate chain into each of its certs.
         def __process_cert(chain):
             begin = "-----BEGIN CERTIFICATE-----"
-            end = "-----END CERTIFICATE-----"
             list_certs = chain.split(begin)
             # if there is only one element, then return it as server.crt:
             if len(list_certs) == 1:
@@ -269,7 +298,7 @@ class PostgresqlCharm(CharmBase):
         if not primary_ip:
             logger.warning("Validation Check Failed: primary_ip not found")
             raise PostgresqlClonePrimaryError("Primary IP not found")
-        if peer_rel.is_primary():
+        if self.peer_rel.is_primary():
             logger.warning("Validation Check Failed: this unit is supposed to be primary")
             raise PostgresqlClonePrimaryError("No Primary unit found")
         if container.get_service("postgresql").is_running():
@@ -277,13 +306,15 @@ class PostgresqlCharm(CharmBase):
             raise PostgresqlClonePrimaryError("Postgresql service still running")
 
         self.model.unit.status = \
-            MaintenanceStatus("Cloning {}".format(primary))
+            MaintenanceStatus("Cloning {}".format(primary_ip))
 
         # Clean up data directory so pg_basebackup can take place
+        # Recursive is mandatory to call os.RemoveAll (which empties ot the folder)
         container.remove_path(PGDATA_PATH, recursive=True)
         # Recreate folder with proper rights
         container.make_dir(
-            PGDATA_PATH, make_parents=True, permissions=)
+            PGDATA_PATH, make_parents=True, permissions=0o750,
+            user="postgres", group="postgres")
 
         # After v10, use --wal-method instead
         if self.pg_version >= "10":
@@ -308,16 +339,19 @@ class PostgresqlCharm(CharmBase):
             "--no-password",
             "--username={}".format(peer_username()),
         ]
-        logger.info("Cloning {} with {}".format(master, " ".join(cmd)))
+        logger.info("Cloning {} with {}".format(primary_ip, " ".join(cmd)))
+        # Run the command on the other container
+        kubeconfig = base64.b64.decode(
+            self.config["kubeconfig"].encode("utf-8"))
+        PsqlK8sAPI(
+            container, kubeconfig, self.model
+        ).exec_command(cmd)
 
         self.update_recovery_conf(primary_ip, container)
-
-        reactive.set_state("postgresql.replication.cloned")
-
         # Now, save the unit's IP that we are following
         self.stored.primary_ip = primary_ip
 
-    def update_recovery_conf(primary_ip, container):
+    def update_recovery_conf(self, primary_ip, container):
         if primary_ip == self.peer_rel.relation.data[self.unit]["ingress-address"]:
             # This is the primary, abort
             logger.info("update_recovery_conf: should not be run as the primary")
@@ -327,13 +361,13 @@ class PostgresqlCharm(CharmBase):
 
         container.push(
             self.hot_standby_path(),
-            render({
+            _render({
                 "streaming_replication": True,
                 "host": primary_ip,
                 "port": 5432,
                 "user": peer_username(),
                 "password": self.stored.db_password
-            }, self.hot_standby_template())
+            }, self.hot_standby_template()),
             user="postgres", group="postgres",
             permissions=0o640, make_dirs=True)
 
