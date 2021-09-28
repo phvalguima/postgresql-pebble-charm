@@ -12,12 +12,12 @@ import os
 import re
 import logging
 import yaml
-import OrderedDict
 import string
 import itertools
 
-from .postgresql import quote_identifier, addr_to_range
-from .peer import peer_username
+from collections import OrderedDict
+
+from postgresql import quote_identifier, addr_to_range
 
 logger = logging.getLogger(__name__)
 
@@ -47,18 +47,20 @@ DO_NOT_TOUCH_KEYS = [
 ]
 
 
-def update_pgpass(container, replication_password):
-    accounts = ["root", "postgres", "ubuntu"]
+def update_pgpass(container, replication_password, peer_username):
+    accounts = ["root", "postgres"]
+    paths = ["/root", "/var/lib/postgresql"]
+    counter = 0
     for account in accounts:
-        path = os.path.expanduser(
-            os.path.join("~{}".format(account), ".pgpass"))
         content = \
             "# Managed by Juju\n*:*:*:{}:{}".format(
-                peer_username(), replication_password)
+                peer_username, replication_password)
         container.push(
-            path, content, user=account, group=account,
+            os.path.join(paths[counter], ".pgpass"),
+            content, user=account, group=account,
             permissions=0o600, make_dirs=True
         )
+        counter += 1
 
 
 def config_yaml():
@@ -273,7 +275,7 @@ def split_extra_pg_auth(raw_extra_pg_auth):
         return raw_extra_pg_auth.splitlines()
 
 
-def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, enable_ssl):
+def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, peer_username, enable_ssl):
     """Update the pg_hba.conf file (host based authentication)."""
     rules = []  # The ordered list, as tuples.
 
@@ -306,26 +308,26 @@ def generate_pg_hba_conf(pg_hba, config, rels, _peer_rel, enable_ssl):
 
     # Peers need replication access as the charm replication user.
     if _peer_rel:
-        for peer, relinfo in _peer_rel.items():
-            for addr in incoming_addresses(relinfo):
+        for u in _peer_rel.units:
+            for addr in incoming_addresses(_peer_rel.data[u]):
                 qaddr = quote_identifier(addr)
                 # Magic replication database, for replication.
                 add(
                     host(enable_ssl),
                     "replication",
-                    peer_username(),
+                    peer_username,
                     qaddr,
                     "md5",
-                    "# {}".format(relinfo),
+                    "# {}".format(u.name),
                 )
                 # postgres db, so leader can query replication status.
                 add(
                     host(enable_ssl),
                     "postgres",
-                    peer_username(),
+                    peer_username,
                     qaddr,
                     "md5",
-                    "# {}".format(relinfo),
+                    "# {}".format(u.name),
                 )
     """
 

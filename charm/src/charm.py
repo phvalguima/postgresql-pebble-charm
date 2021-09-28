@@ -10,6 +10,7 @@ This charm allows to deploy a postgresql cluster on top of k8s using
 pebble.
 """
 
+import re
 import os
 import logging
 import base64
@@ -18,17 +19,17 @@ import datetime
 from ops.charm import CharmBase
 from ops.framework import StoredState
 from ops.main import main
-from ops.model import ActiveStatus, MaintenanceStatus
+from ops.model import ActiveStatus, MaintenanceStatus, BlockedStatus
 from ops.pebble import PathError
 
-from .peer import PostgresqlPeerRelation, peer_username
-from .configfiles import (
+from peer import PostgresqlPeerRelation, peer_username
+from configfiles import (
     update_pgpass,
     generate_pg_hba_conf,
     update_postgresql_conf
 )
-from .kube_api import PsqlK8sAPI
-from .postgresql import create_replication_user
+from kube_api import PsqlK8sAPI
+from postgresql import create_replication_user
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,13 @@ class PostgresqlCharm(CharmBase):
         """Builds the dictionary containing all the env vars"""
 
     def on_start(self, event):
-        pass
+        """Module psycopg2 needs to be installed via apt. Install it via apt instead.
+        """
+        import subprocess
+        subprocess.check_call(["apt", "update"], stdout=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["apt", "install", "-y", "python3-psycopg2"],
+            stdout=subprocess.DEVNULL)
 
     def on_peer_relation_joined(self, event):
         """We need to select the primary unit and set the replication password.
@@ -95,8 +102,8 @@ class PostgresqlCharm(CharmBase):
         if not self.unit.is_leader():
             return
         # Leader unit, set it as primary
-        self.set_as_primary()
-        self.set_replication_pwd()
+        self.peer_rel.set_as_primary()
+        self.peer_rel.set_replication_pwd()
         self.peer_rel.peer_changed(event)
 
     def on_peer_relation_changed(self, event):
@@ -193,18 +200,24 @@ class PostgresqlCharm(CharmBase):
         # Following tasks need to be done:
         # 2.1) Check if primary, if not then stop the service
         if self.peer_rel.relation:
-            if not self.peer_rel.is_primary():
+            if not self.peer_rel.is_primary() and svc.is_running():
                 # Stop service so we can run the replication
                 container.stop("postgresql")
             # 2.2) Save the password on .pgpass
-            update_pgpass(container, self.peer_rel.primary_repl_pwd())
+            update_pgpass(
+                container, self.peer_rel.primary_repl_pwd(),
+                peer_username())
             if not self.peer_rel.is_primary():
                 # Clone the repo from upstream
-                self.clone_primary()
+                try:
+                    self.clone_primary(container)
+                except PostgresqlClonePrimaryError as e:
+                    self.model.unit.status = BlockedStatus(str(e))
         # 2.3) Generate the configuration
         self.ssl_config(container)
-        self._configure_postgresql_conf(container, self.stored.enable_ssl)
-        self._configure_pg_auth_conf(container, self.stored.enable_ssl)
+        self._configure_postgresql_conf(container)
+        self._configure_pg_auth_conf(container)
+        self._update_pg_ident_conf(container)
 
         # 3) Restart strategy:
         # Use ops framework methods to restart services
@@ -215,12 +228,37 @@ class PostgresqlCharm(CharmBase):
         else:
             container.start("postgresql")
 
+    def _update_pg_ident_conf(self, container):
+        """Add the charm's required entry to pg_ident.conf"""
+        entries = set([("root", "postgres"), ("postgres", "postgres")])
+        path = self.pg_ident_conf_path()
+        content = None
+        with container.pull(path) as f:
+            current_pg_ident = f.read()
+        for sysuser, pguser in entries:
+            if (
+                re.search(
+                    r"^\s*juju_charm\s+{}\s+{}\s*$".format(sysuser, pguser),
+                    current_pg_ident,
+                    re.M,
+                )
+                is None
+            ):
+                content = "\njuju_charm {} {}".format(sysuser, pguser)
+                container.push(
+                    self.pg_hba_conf_path(),
+                    content,
+                    user="postgres", group="postgres",
+                    permissions=0o640, make_dirs=True)
+
     def _configure_pg_auth_conf(self, container):
         """Loads current pg_auth config.
         """
         self.stored.pg_hba = generate_pg_hba_conf(
             self._read_container_file(self.pg_hba_conf_path()),
-            self.config, None, None)
+            self.config, None, self.peer_rel.relation, peer_username(),
+            self.stored.enable_ssl
+        )
         container.push(
             self.pg_hba_conf_path(),
             self.stored.pg_hba,
@@ -240,8 +278,8 @@ class PostgresqlCharm(CharmBase):
             permissions=0o640, make_dirs=True)
 
     def ssl_config(self, container):
-        if len(self.config.get("ssl_cert", "")) > 0 or \
-           len(self.config.get("ssl_key", "")) > 0:
+        if len(self.config.get("ssl_cert", "")) == 0 or \
+           len(self.config.get("ssl_key", "")) == 0:
             logger.info("ssl_config: crt or key not passed, returning")
             self.stored.enable_ssl = False
             return
@@ -260,7 +298,7 @@ class PostgresqlCharm(CharmBase):
             return begin.join(list_certs[0:-1]), begin + list_certs[-1:][0]
 
         # Root cert is composed of all the certs except last one
-        root_crt, server_crt = __process_cert(base64.b64.decode(
+        root_crt, server_crt = __process_cert(base64.b64decode(
             self.config["ssl_cert"].encode("utf-8")))
         # Generate ssl_cert
         container.push(
@@ -268,7 +306,7 @@ class PostgresqlCharm(CharmBase):
             server_crt,
             user="postgres", group="postgres",
             permissions=0o640, make_dirs=True)
-        # If root crt present, generate it:
+        # If root crt present, generate it
         if root_crt:
             container.push(
                 os.path.join(PGDATA_PATH, "root.crt"),
@@ -278,7 +316,7 @@ class PostgresqlCharm(CharmBase):
         # Generate the key
         container.push(
             os.path.join(PGDATA_PATH, "server.key"),
-            base64.b64.decode(self.config["ssl_key"].encode("utf-8")),
+            base64.b64decode(self.config["ssl_key"].encode("utf-8")),
             user="postgres", group="postgres",
             permissions=0o600, make_dirs=True)
         self.stored.enable_ssl = True
@@ -341,7 +379,7 @@ class PostgresqlCharm(CharmBase):
         ]
         logger.info("Cloning {} with {}".format(primary_ip, " ".join(cmd)))
         # Run the command on the other container
-        kubeconfig = base64.b64.decode(
+        kubeconfig = base64.b64decode(
             self.config["kubeconfig"].encode("utf-8"))
         PsqlK8sAPI(
             container, kubeconfig, self.model
@@ -388,9 +426,12 @@ class PostgresqlCharm(CharmBase):
     # Get conf paths #
     #                #
     ##################
+    def pg_ident_conf_path(self):
+        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
+        return os.path.join(etc_path, "pg_ident.conf")
 
     def standby_signal_path(self):
-        etc_path = POSTGRESQL_CONF_PATH.format(self.pg_version)
+        etc_path = PGDATA_PATH.format(self.pg_version)
         return os.path.join(etc_path, "standby.signal")
 
     def hot_standby_path(self):

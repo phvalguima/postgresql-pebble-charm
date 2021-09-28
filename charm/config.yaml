@@ -2,6 +2,16 @@
 # See LICENSE file for licensing details.
 
 options:
+  admin_addresses:
+    type: string
+    default: ''
+    description: |
+      A comma-separated list of IP Addresses (or single IP) admin tools
+      like pgAdmin3 will connect from. The IP addresses added here will
+      be included in the pg_hba.conf file allowing ip connections to all
+      databases on the server from the given IP addresses using md5
+      password encryption. IP address ranges are also supported,
+      using the standard format described in the PostgreSQL reference guide.
   ssl_cert:
     default: ''
     type: string
@@ -27,6 +37,16 @@ options:
     type: string
     description: |
       Key to be used in base64
+  extra_pg_auth:
+    type: string
+    default: ''
+    description: |
+      A extra pg_hba.conf auth rules. This will be included as-is into
+      the pg_hba.conf file. Note that this should not be needed as db
+      relations already create those rules the right way. Use this
+      feature to allow clients to connect from outside the environment,
+      or to configure replication between unrelated PostgreSQL services
+      using the manual_replication option.
   extra_pg_conf:
     type: string
     description: |

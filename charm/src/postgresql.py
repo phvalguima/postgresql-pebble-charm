@@ -7,7 +7,6 @@ Based on: https://github.com/stub42/postgresql-charm/blob/7f9eddf32f818e4d035e7b
 """ # noqa
 
 import re
-import psycopg2
 
 
 def role_exists(con, role):
@@ -19,6 +18,8 @@ def role_exists(con, role):
 
 def pgidentifier(token):
     """Wrap a string for interpolation by psycopg2 as an SQL identifier"""
+    import psycopg2
+
     return psycopg2.extensions.AsIs(quote_identifier(token))
 
 
@@ -42,6 +43,8 @@ def create_replication_user(username, replication_pwd, local_ip="127.0.0.1"):
 
 
 def connect(user="postgres", database="postgres", host=None, port=5432):
+    import psycopg2
+
     if not host:
         return None
     return psycopg2.connect(user=user, database=database, host=host, port=port)

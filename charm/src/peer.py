@@ -15,8 +15,8 @@ peer_username to
 """
 from ops.framework import StoredState
 
-from .configfiles import genRandomPassword
-from .postgresql_relation import PostgresqlRelation
+from configfiles import genRandomPassword
+from postgresql_relation import PostgresqlRelation
 
 
 def peer_username():
@@ -74,8 +74,8 @@ class PostgresqlPeerRelation(PostgresqlRelation):
 
     def primary_repl_pwd(self):
         """Returns the primary ingress-address, or None if not available."""
-        if not self.relation:
-            return self._replication_pwd
+        if not self.relation or not self.get_primary_unit():
+            return self.stored.replication_pwd
         return self.relation.data[self.get_primary_unit()]["replication_pwd"]
 
     def set_replication_pwd(self, repl_pwd=None):
@@ -86,25 +86,25 @@ class PostgresqlPeerRelation(PostgresqlRelation):
                 repl_pwd
             return
         self.relation.data[self.unit]["replication_pwd"] = \
-            self._replication_pwd
+            self.stored.replication_pwd
 
     def set_as_primary(self):
         """This method selects this unit to be the primary of the databases
         and announces it to its peers.
         """
         import time
-        self.relation.data[self.unit]["primary"] = time.time()
+        self.relation.data[self.unit]["primary"] = str(time.time())
 
     def get_primary_unit(self):
         """Returns the unit holding the primary DB"""
-        latest_ts = self.relation.data[self.unit].get("primary", -1.0)
+        latest_ts = float(self.relation.data[self.unit].get("primary", -1.0))
         primary = self.unit if latest_ts > 0.0 else None
         for u in self.relation.units:
-            if latest_ts < self.relation.data[u].get("primary", -2.0):
+            if latest_ts < float(self.relation.data[u].get("primary", -2.0)):
                 # More recent timestamp, update:
-                latest_ts = self.relation.data[u]["primary"]
+                latest_ts = float(self.relation.data[u]["primary"])
                 primary = u
-            elif latest_ts == self.relation.data[u]["primary"] and \
+            elif latest_ts == float(self.relation.data[u].get("primary", -2.0)) and \
                     u.name.split("/")[1] > primary.name.split("/")[1]:
                 # Corner case: both units registered as primary exactly at
                 # the same time. Select the one with the highest unit number
