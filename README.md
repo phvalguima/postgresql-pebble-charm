@@ -10,44 +10,21 @@ In the documentation and the code, "primary database" or only "primary" refers t
 
 ## Usage
 
-To deploy it, run: .........
+### Pass kubeconfig as an option
+
+Kubernetes API is used to execute commands on 
 
 ### Test it locally with microk8s
 
-## Relations
+Follow microk8s.io documentation to set it up.
 
-TODO: Provide any relations which are provided or required by your charm
+Deploy Juju on top of microk8s.
 
-
-## Replication
-
-There are several scenarios where data can be replicated across units, from volume to node replication.
-
-This charm implements two models of node replication, [as described here](https://www.postgresql.org/docs/12/high-availability.html). These methods are "streaming" and "synchronous".
-
-In a multinode deployment, it is possible to select one of the two replications above, but not disable replication entirely.
-
-To select which option is the most appropriate, toggle ```synchronous_replication```.
-
-### Streaming Replication
-
-Streaming replication is assynchronous by default. Its nodes will always lag behind in replicating primary's WAL for a adjustable bit.
-
-The advantage of streaming replication is the lower latency of not waiting transactions to be ack'ed directly. However, there is always a risk of data loss in case where the primary unit is lost.
-
-### Synchronous Replication
-
-Synchronous replication allows the charm to also manage the ```synchronous_standby_names``` counting with the secondary standby units available.
-
-WARNING: it is considered EXPERIMENTAL to leave ```synchronous_replication=True``` and ```failover=False```. This case triggers the "charm switchover" and "charm management" logic path.
-
-### Synchronous Replication with Failover
-
-If both ```synchronous_replication=True``` and ```failover=True```, then the charm will deploy [pg_auto_failover extension](https://github.com/citusdata/pg_auto_failover). This extension allows to manage database failover by keeping track of WAL replication across primary and secondaries and updates synchronous_standby_names. In the case a secondary falls too behind, it removes the secondary database from synchronous_standby_names.
-
-### What if I do not want replication?
-
-Although out of scope of the present documentation, an user can select to not have replication at all. In this case, it is enough to deploy just one unit of this database.
+Run the following commands:
+```
+$ juju add-model postgresql # or your name of choice
+$ juju deploy ch:postgresql
+```
 
 
 # Implementation details
@@ -92,12 +69,41 @@ The root password can be defined via config options ``` override-root-password: 
 
 ## Build the OCI image
 
+Docker is needed to create the base image.
+
+Run the following commands to prepare the OCI image:
+
+```
+$ cd docker/<postgresql-version-of-choice>/
+$ docker build . -t <your tag>
+```
+
+Then push it to the registry to start using.
+
 ## Build the charm
+
+Charmcraft is necessary to prepare the package.
+
+Run the following steps to prepare it:
+```
+$ cd charm/
+$ charmcraft -v pack
+```
+
+## Test your charm
+
+Tox and flake8 is available. Run the following tests to validate your changes:
+```
+$ cd charm/
+$ tox -e pep8
+```
 
 # TODOs: What this application needs?
 
 Tasks:
 * Deprecate kube_api.py once [pebble#37](https://github.com/canonical/pebble/issues/37) is available
+* Remove _stop_app charm logic once it is fixed [pebble#70](https://github.com/canonical/pebble/issues/70)
+* Add replication and failover documentation alongside the code
 
 Features:
 * Clustering: how to deploy postgresql in active/backup and ensure the data is correctly replicated

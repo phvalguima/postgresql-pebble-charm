@@ -253,6 +253,8 @@ def incoming_addresses(relinfo):
         return [addr_to_range(relinfo["ingress-address"])]
     if "private-address" in relinfo:
         return [addr_to_range(relinfo["private-address"])]
+    if "pod-ip" in relinfo:
+        return [addr_to_range(relinfo["pod-ip"])]
     return []
 
 

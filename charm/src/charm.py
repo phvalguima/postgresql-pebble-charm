@@ -41,7 +41,7 @@ PGDATA_PATH = "/var/lib/postgresql/data"
 def _render(configs, filepath, template_dir="templates/"):
     from jinja2 import Environment, FileSystemLoader
     env = Environment(loader=FileSystemLoader(template_dir))
-    template = env.get_template(os.path.join(template_dir, filepath))
+    template = env.get_template(filepath)
     config = template.render(**configs)
     return config
 
@@ -133,17 +133,8 @@ class PostgresqlCharm(CharmBase):
     def on_peer_relation_joined(self, event):
         """We need to select the primary unit and set the replication password.
         """
-        if not self.unit.is_leader():
-            return
-        # Leader unit, set it as primary
-        self.peer_rel.set_as_primary()
-        self.peer_rel.set_replication_pwd()
-        self.peer_rel.peer_changed(event)
-
-    def on_peer_relation_changed(self, event):
-        """The actual setup of the secondary database happens now.
-        This gives the primary some time to set it up before.
-        """
+        # Needed to add the pod-ip available in the relation
+        self.peer_rel.peer_joined(event)
         # Create the replication user if primary:
         if self.peer_rel.is_primary() and \
            len(self.stored.repl_user) == 0:
@@ -152,6 +143,16 @@ class PostgresqlCharm(CharmBase):
                 self.stored.repl_user,
                 self.peer_rel.primary_repl_pwd()
             )
+        if not self.unit.is_leader():
+            return
+        # Leader unit, set it as primary
+        self.peer_rel.set_as_primary()
+        self.peer_rel.set_replication_pwd()
+
+    def on_peer_relation_changed(self, event):
+        """The actual setup of the secondary database happens now.
+        This gives the primary some time to set it up before.
+        """
         self.on_config_changed(event)
 
     def _read_container_file(self, path):
@@ -166,7 +167,7 @@ class PostgresqlCharm(CharmBase):
                 # This should only happen when this method is called before
                 # pebble-ready hook, which is unlikely
                 pass
-        return content
+        return content or ""
 
     def on_postgresql_pebble_ready(self, event):
         """Define the workload using Pebble API.
@@ -260,23 +261,44 @@ class PostgresqlCharm(CharmBase):
 
         # 3) Restart strategy:
         # Use ops framework methods to restart services
-        if svc.is_running():
-            logger.debug("Restart call start time: {}".format(datetime.datetime.now()))
-            # container.restart("postgresql")
+        self._postgresql_svc_start(restart=svc.is_running())
+        self.model.unit.status = ActiveStatus("psql configured")
+
+    def _postgresql_svc_start(self, restart=False):
+        """This method calls the container (re)start.
+
+        There are some steps to look after, however:
+        1) Due to pebble issue#70, we manually stop the service if restart is asked
+        2) Verify that $PGDATA/PG_VERSION exists: that file is used to discover if
+           the database has already been created in the docker-entrypoint.sh. Given
+           docker-entrypoint.sh has been already ran for the first time at pebble-ready,
+           that file must exist or we create it manually.
+        3) Run the (re)start
+        """
+        container = self.unit.get_container(self.app.name)
+        # 1) if restart, we need to manually stop it:
+        if restart:
             self._stop_app()
+        # 2) Check for $PGDATA/PG_VERSION, create it if not available
+        container.push(
+            self.pg_version_path(),
+            self.pg_version,
+            user="postgres", group="postgres",
+            permissions=0o640, make_dirs=True)
+        # Doing step (3)
+        if restart:
+            logger.debug("Restart call start time: {}".format(datetime.datetime.now()))
             container.restart("postgresql")
             logger.debug("Restart call end time: {}".format(datetime.datetime.now()))
         else:
             container.start("postgresql")
-        self.model.unit.status = ActiveStatus("psql configured")
 
     def _update_pg_ident_conf(self, container):
         """Add the charm's required entry to pg_ident.conf"""
         entries = set([("root", "postgres"), ("postgres", "postgres")])
         path = self.pg_ident_conf_path()
         content = None
-        with container.pull(path) as f:
-            current_pg_ident = f.read()
+        current_pg_ident = self._read_container_file(path)
         for sysuser, pguser in entries:
             if (
                 re.search(
@@ -408,6 +430,10 @@ class PostgresqlCharm(CharmBase):
         container.make_dir(
             PGDATA_PATH, make_parents=True, permissions=0o750,
             user="postgres", group="postgres")
+        # Start cloning, we need to make sure some basic configs are
+        # in place before doing the basebackup
+        self._configure_pg_auth_conf(container)
+        self._update_pg_ident_conf(container)
 
         # After v10, use --wal-method instead
         if self.pg_version >= "10":
@@ -492,6 +518,10 @@ class PostgresqlCharm(CharmBase):
     def postmaster_pid_path(self):
         etc_path = PGDATA_PATH.format(self.pg_version)
         return os.path.join(etc_path, "postmaster.pid")
+
+    def pg_version_path(self):
+        etc_path = PGDATA_PATH.format(self.pg_version)
+        return os.path.join(etc_path, "PG_VERSION")
 
     def standby_signal_path(self):
         etc_path = PGDATA_PATH.format(self.pg_version)

@@ -25,6 +25,13 @@ def peer_username():
     return "_juju_repl"
 
 
+def _discover_pod_ip():
+    import socket
+    hostname = socket.gethostname()
+    ip_address = socket.gethostbyname(hostname)
+    return str(ip_address)
+
+
 class PostgresqlPeerRelation(PostgresqlRelation):
 
     stored = StoredState()
@@ -59,7 +66,7 @@ class PostgresqlPeerRelation(PostgresqlRelation):
     def peer_addresses(self):
         addresses = []
         for u in self.relation.units:
-            addresses.append(str(self.relation.data[u]["ingress-address"]))
+            addresses.append(str(self.relation.data[u]["pod-ip"]))
         return addresses
 
     @property
@@ -114,7 +121,7 @@ class PostgresqlPeerRelation(PostgresqlRelation):
     def get_primary_ip(self):
         """Returns the primary ingress-address, or None if not available."""
         primary = self.get_primary_unit()
-        return self.relation.data[primary]["ingress-address"] if primary else None
+        return self.relation.data[primary]["pod-ip"] if primary else None
 
     def is_primary(self):
         """Returns True if this unit holds the latest"""
@@ -133,6 +140,11 @@ class PostgresqlPeerRelation(PostgresqlRelation):
         """This method disables the primary management."""
         if "primary" in self.relation.data[self.unit]:
             del self.relation.data[self.unit]["primary"]
+
+    def peer_joined(self, event):
+        # Not expecting it to change over pod lifecycle
+        # Publish the POD IP
+        self.relation.data[self.unit]["pod-ip"] = _discover_pod_ip()
 
     def peer_changed(self, event):
         """Run the peer changed hook.
